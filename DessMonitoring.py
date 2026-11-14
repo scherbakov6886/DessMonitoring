@@ -10,6 +10,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, parse_qsl, quote
+# //Щербаков 14.11.2026
+from zoneinfo import ZoneInfo
+# //Щербаков 14.11.2026
 
 import requests
 
@@ -35,12 +38,59 @@ HTTP_TIMEOUT = 20
 CHECK_CYCLES = max(1, int(os.getenv('DESS_CYCLES', '5') or '5'))
 CHECK_INTERVAL = max(1, int(os.getenv('DESS_INTERVAL', '60') or '60'))
 
+# //Щербаков 14.11.2026
+# Часовой пояс для вывода времени в уведомлениях (на runner GitHub системное время UTC).
+DESS_TZ = os.getenv('DESS_TZ', '') or 'Europe/Kyiv'
+# Часовой пояс, в котором DessMonitor отдаёт время замера, если оно пришло строкой
+# вида "2026-11-14 12:34:56" (не epoch). Если не задан, строка выводится как есть.
+DESS_TS_TZ = os.getenv('DESS_TS_TZ', '')
+# //Щербаков 14.11.2026
+
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / 'dessmonitor_state.json'
 
 logger = logging.getLogger('dessmonitor_bot')
 logger.setLevel(logging.INFO)
 logger.propagate = False
+
+
+# //Щербаков 14.11.2026
+def get_tz(name):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        logger.warning('Неизвестный часовой пояс "%s", используется UTC', name)
+        return timezone.utc
+
+
+def parse_measured_at(ts):
+    """Время замера с инвертора (поле gts) -> datetime в часовом поясе DESS_TZ.
+    Поддерживаются epoch (сек/мс) и строка 'YYYY-MM-DD HH:MM:SS'."""
+    if ts is None:
+        return None
+    display_tz = get_tz(DESS_TZ)
+
+    if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.strip().isdigit()):
+        numeric = float(ts)
+        if numeric > 1e12:
+            numeric /= 1000.0
+        return datetime.fromtimestamp(numeric, timezone.utc).astimezone(display_tz)
+
+    if isinstance(ts, str):
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y/%m/%d %H:%M:%S'):
+            try:
+                naive = datetime.strptime(ts.strip(), fmt)
+            except ValueError:
+                continue
+            if DESS_TS_TZ:
+                return naive.replace(tzinfo=get_tz(DESS_TS_TZ)).astimezone(display_tz)
+            return naive.replace(tzinfo=display_tz)
+    return None
+
+
+def fmt_dt(value):
+    return value.strftime('%d.%m.%Y %H:%M:%S') if value else 'не передано'
+# //Щербаков 14.11.2026
 
 
 def validate_settings():
@@ -111,7 +161,6 @@ class DessMonitorClient:
             raise RuntimeError('Авторизация прошла без token/secret. Проверь company-key.')
         logger.info('DessMonitor: авторизация выполнена успешно')
 
-    # //Щербаков 14.11.2026
     def _request_data(self):
         salt = str(int(time.time() * 1000))
         action = '&' + urlencode(self.device_parameters, quote_via=quote)
@@ -132,7 +181,6 @@ class DessMonitorClient:
             self.secret = None
             self.authenticate()
             return self._request_data()
-    # //Щербаков 14.11.2026
 
 
 def flatten_items(value):
@@ -173,12 +221,9 @@ def extract_snapshot(payload):
         battery_voltage = next((as_number(i.get('val')) for i in items if i.get('id') == 'bt_eybond_read_20'), None)
 
     ts = data.get('gts')
-    measured_at = None
-    if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.isdigit()):
-        numeric = float(ts)
-        if numeric > 1e12:
-            numeric /= 1000.0
-        measured_at = datetime.fromtimestamp(numeric, timezone.utc)
+    # //Щербаков 14.11.2026
+    measured_at = parse_measured_at(ts)
+    # //Щербаков 14.11.2026
 
     if grid is None and not mode:
         raise ValueError('Не найдены ни Grid Voltage, ни Operating mode')
@@ -188,6 +233,9 @@ def extract_snapshot(payload):
         'status': status, 'voltage': grid, 'mode': mode,
         'soc': soc, 'battery_voltage': battery_voltage,
         'measured_at': measured_at.isoformat() if measured_at else None,
+        # //Щербаков 14.11.2026
+        'measured_label': fmt_dt(measured_at) if measured_at else None,
+        # //Щербаков 14.11.2026
         'sample_id': str(ts) if ts is not None else None
     }
 
@@ -233,16 +281,22 @@ def run_check(client, state):
     last_sample = state.get('last_seen_sample')
     prev_status = state.get('grid_status')
 
-    logger.info('Текущий семпл: %s | Статус: %s | Напряжение: %s | SOC: %s',
-                current_sample, current_status, fmt_voltage(snap['voltage']), snap['soc'])
+    # //Щербаков 14.11.2026
+    # Время замера с инвертора; если не передано, подставляем текущее время в нужном поясе
+    time_label = snap['measured_label'] or fmt_dt(datetime.now(get_tz(DESS_TZ)))
+    # //Щербаков 14.11.2026
+
+    logger.info('Текущий семпл: %s | Статус: %s | Напряжение: %s | SOC: %s | Замер: %s',
+                current_sample, current_status, fmt_voltage(snap['voltage']), snap['soc'], time_label)
 
     if current_sample != last_sample:
         if prev_status is not None and current_status != prev_status:
-            time_label = datetime.now(timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M:%S')
+            # //Щербаков 14.11.2026
             if current_status == 'OFF':
-                notify(f'🔴 <b>ОТКЛЮЧИЛИ СВЕТ</b>\n\nСеть: {fmt_voltage(snap["voltage"])}\nОбнаружено: {time_label}')
+                notify(f'🔴 <b>ОТКЛЮЧИЛИ СВЕТ</b>\n\nСеть: {fmt_voltage(snap["voltage"])}\nВремя замера: {time_label}')
             else:
-                notify(f'🟢 <b>СВЕТ ПОЯВИЛСЯ</b>\n\nСеть: {fmt_voltage(snap["voltage"])}\nОбнаружено: {time_label}')
+                notify(f'🟢 <b>СВЕТ ПОЯВИЛСЯ</b>\n\nСеть: {fmt_voltage(snap["voltage"])}\nВремя замера: {time_label}')
+            # //Щербаков 14.11.2026
 
         state['grid_status'] = current_status
         state['last_seen_sample'] = current_sample
@@ -250,7 +304,9 @@ def run_check(client, state):
     soc = snap['soc']
     if soc is not None and 0 <= soc <= 100:
         if soc <= LOW_BATTERY_SOC and not state.get('low_battery', False):
-            notify(f'🪫 <b>Низкий заряд аккумулятора: {soc:.0f}%</b>')
+            # //Щербаков 14.11.2026
+            notify(f'🪫 <b>Низкий заряд аккумулятора: {soc:.0f}%</b>\n\nВремя замера: {time_label}')
+            # //Щербаков 14.11.2026
             state['low_battery'] = True
         elif soc >= RECOVERY_BATTERY_SOC:
             state['low_battery'] = False
