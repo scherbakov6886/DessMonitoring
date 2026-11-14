@@ -1,5 +1,5 @@
 {
-  "grid_status": null,
-  "last_seen_sample": null,
+  "grid_status": "OFF",
+  "last_seen_sample": "1794644010133",
   "low_battery": false
 }
