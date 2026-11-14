@@ -51,4 +51,6 @@ jobs:
           DESS_COMPANY_KEY: ${{ secrets.DESS_COMPANY_KEY }}
           DESS_CYCLES: '5'      # количество проверок за запуск
           DESS_INTERVAL: '60'   # интервал между проверками, сек
+          DESS_TZ: 'Europe/Kyiv'
+          DESS_TS_TZ: 'UTC'   # поменяйте на пояс, в котором DessMonitor отдаёт строку gts
         run: python DessMonitoring.py
