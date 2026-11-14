@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,14 +20,6 @@ TG_CHAT_IDS = [int(x) for x in os.getenv('TG_CHAT_IDS', '').replace(',', ' ').sp
 
 DESS_REQUEST_URL = os.getenv('DESS_REQUEST_URL', '')
 
-# Парсинг параметров устройства из DESS_REQUEST_URL, если он задан
-_url_params = dict(parse_qsl(urlsplit(DESS_REQUEST_URL).query, keep_blank_values=True)) if DESS_REQUEST_URL else {}
-
-DESS_PN       = os.getenv('DESS_PN') or _url_params.get('pn', '')
-DESS_DEVCODE  = os.getenv('DESS_DEVCODE') or _url_params.get('devcode', '')
-DESS_DEVADDR  = os.getenv('DESS_DEVADDR') or _url_params.get('devaddr', '')
-DESS_SN       = os.getenv('DESS_SN') or _url_params.get('sn', '')
-
 DESS_USER = os.getenv('DESS_USER', '')
 DESS_PASSWORD = os.getenv('DESS_PASSWORD', '')
 DESS_COMPANY_KEY = os.getenv('DESS_COMPANY_KEY', '')
@@ -42,9 +33,6 @@ HTTP_TIMEOUT = 20
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / 'dessmonitor_state.json'
 
-def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-
 logger = logging.getLogger('dessmonitor_bot')
 logger.setLevel(logging.INFO)
 logger.propagate = False
@@ -57,8 +45,7 @@ def validate_settings():
     if not DESS_USER: missing.append('DESS_USER')
     if not DESS_PASSWORD: missing.append('DESS_PASSWORD')
     if not DESS_COMPANY_KEY: missing.append('DESS_COMPANY_KEY')
-    if not all((DESS_PN, DESS_DEVCODE, DESS_DEVADDR, DESS_SN)):
-        missing.append('Параметры устройства (pn, devcode, devaddr, sn) не найдены ни в DESS_REQUEST_URL, ни в переменных окружения')
+    if not DESS_REQUEST_URL: missing.append('DESS_REQUEST_URL')
     if missing:
         raise SystemExit('Не заполнены настройки: ' + ', '.join(missing))
 
@@ -80,11 +67,16 @@ class DessMonitorClient:
         self.session.headers.update({'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
         self.token = None
         self.secret = None
-        self.device_parameters = [
-            ('action', 'querySPDeviceLastData'),
-            ('pn', DESS_PN), ('devcode', DESS_DEVCODE),
-            ('devaddr', DESS_DEVADDR), ('sn', DESS_SN),
-        ]
+        
+        # Автоматически извлекаем все параметры устройства из переданного Request URL
+        if DESS_REQUEST_URL:
+            params = [(k, v) for k, v in parse_qsl(urlsplit(DESS_REQUEST_URL).query, keep_blank_values=True)
+                      if k not in ('sign', 'salt', 'token')]
+            if not any(k == 'action' for k, _ in params):
+                params.insert(0, ('action', 'querySPDeviceLastData'))
+            self.device_parameters = params
+        else:
+            self.device_parameters = [('action', 'querySPDeviceLastData')]
 
     def get_json(self, url):
         response = self.session.get(url, timeout=HTTP_TIMEOUT)
@@ -232,7 +224,6 @@ def main():
     logger.info('Текущий семпл: %s | Статус: %s | Напряжение: %s | SOC: %s', 
                 current_sample, current_status, fmt_voltage(snap['voltage']), snap['soc'])
 
-    # Если появился новый замер и статус изменился по сравнению с предыдущим
     if current_sample != last_sample:
         if prev_status is not None and current_status != prev_status:
             time_label = datetime.now(timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M:%S')
@@ -244,7 +235,6 @@ def main():
         state['grid_status'] = current_status
         state['last_seen_sample'] = current_sample
 
-    # Проверка уровня заряда батареи
     soc = snap['soc']
     if soc is not None and 0 <= soc <= 100:
         if soc <= LOW_BATTERY_SOC and not state.get('low_battery', False):
