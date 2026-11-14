@@ -2,10 +2,12 @@ name: DessMonitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # минимальный интервал, который поддерживает GitHub
+    # Щербаков 14.11.2026
+    - cron: '3-58/5 * * * *'   # минуты 3, 8, 13 ... 58 (не круглые, реже пропускаются)
+    # Щербаков 14.11.2026
   workflow_dispatch:         # ручной запуск для проверки
 
-# Не запускать два job одновременно (запуск длится ~4 мин, GitHub может задержать следующий)
+# Не запускать два job одновременно
 concurrency:
   group: dessmonitor
   cancel-in-progress: false
@@ -30,9 +32,6 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      # Восстанавливаем state с прошлого запуска.
-      # Кэш в GitHub неизменяемый, поэтому ключ уникален для каждого запуска,
-      # а restore-keys подтягивает самый свежий сохранённый кэш.
       - name: Restore state
         uses: actions/cache@v4
         with:
@@ -51,6 +50,4 @@ jobs:
           DESS_COMPANY_KEY: ${{ secrets.DESS_COMPANY_KEY }}
           DESS_CYCLES: '5'      # количество проверок за запуск
           DESS_INTERVAL: '60'   # интервал между проверками, сек
-          DESS_TZ: 'Europe/Kyiv'
-          DESS_TS_TZ: 'UTC'   # поменяйте на пояс, в котором DessMonitor отдаёт строку gts
         run: python DessMonitoring.py
