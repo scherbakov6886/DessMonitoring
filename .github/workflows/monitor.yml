@@ -1,20 +1,28 @@
-name: DessMonitor Check
+name: DessMonitor
 
 on:
   schedule:
-    - cron: '*/1 * * * *' # Запуск каждую минуту
-  workflow_dispatch: # Позволяет запускать проверку вручную кнопкой в интерфейсе
+    - cron: '*/5 * * * *'   # минимальный интервал, который поддерживает GitHub
+  workflow_dispatch:         # ручной запуск для проверки
+
+# Не запускать два job одновременно (запуск длится ~4 мин, GitHub может задержать следующий)
+concurrency:
+  group: dessmonitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  run-monitor:
+  check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Обязательно для сохранения файла состояния в репозиторий
+    timeout-minutes: 6      # скрипт работает ~4 минуты (5 проверок по 60 сек)
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -22,7 +30,18 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run monitoring script
+      # Восстанавливаем state с прошлого запуска.
+      # Кэш в GitHub неизменяемый, поэтому ключ уникален для каждого запуска,
+      # а restore-keys подтягивает самый свежий сохранённый кэш.
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: dessmonitor_state.json
+          key: dessmonitor-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            dessmonitor-state-
+
+      - name: Run DessMonitoring
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
@@ -30,13 +49,6 @@ jobs:
           DESS_USER: ${{ secrets.DESS_USER }}
           DESS_PASSWORD: ${{ secrets.DESS_PASSWORD }}
           DESS_COMPANY_KEY: ${{ secrets.DESS_COMPANY_KEY }}
+          DESS_CYCLES: '5'      # количество проверок за запуск
+          DESS_INTERVAL: '60'   # интервал между проверками, сек
         run: python DessMonitoring.py
-
-      - name: Commit and push state changes
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add dessmonitor_state.json
-          git status
-          git commit -m "chore: update monitor state [skip ci]" || echo "No changes to commit"
-          git push
