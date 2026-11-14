@@ -34,7 +34,7 @@ jobs:
           DESS_USER: ${{ secrets.DESS_USER }}
           DESS_PASSWORD: ${{ secrets.DESS_PASSWORD }}
           DESS_COMPANY_KEY: ${{ secrets.DESS_COMPANY_KEY }}
-        run: python DessMonitor.py
+        run: python DessMonitoring.py
 
       - name: Commit and push state changes
         run: |
