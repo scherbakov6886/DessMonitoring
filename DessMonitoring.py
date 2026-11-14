@@ -41,6 +41,9 @@ HTTP_TIMEOUT = 20
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / 'dessmonitor_state.json'
 
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+
 logger = logging.getLogger('dessmonitor_bot')
 logger.setLevel(logging.INFO)
 logger.propagate = False
