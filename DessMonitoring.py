@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""DessMonitor -> Telegram: отключение/восстановление сети и низкий SOC (версия для разовых запусков по cron)."""
+"""DessMonitor -> Telegram: отключение/восстановление сети и низкий SOC.
+Запуск по cron раз в 5 минут; внутри одного запуска опрос каждую минуту."""
 import hashlib
-import html
 import json
 import logging
 import os
@@ -29,6 +29,11 @@ LOW_BATTERY_SOC = 20    # %
 RECOVERY_BATTERY_SOC = 25  # гистерезис SOC
 LOW_BATTERY_VOLTAGE = float((os.getenv('DESS_LOW_BATTERY_VOLTAGE', '0') or '0').replace(',', '.')) or 0.0
 HTTP_TIMEOUT = 20
+
+# Количество проверок за один запуск и интервал между ними (сек).
+# 5 проверок * 60 сек => работа ~4 минуты, запуск по cron каждые 5 минут.
+CHECK_CYCLES = max(1, int(os.getenv('DESS_CYCLES', '5') or '5'))
+CHECK_INTERVAL = max(1, int(os.getenv('DESS_INTERVAL', '60') or '60'))
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / 'dessmonitor_state.json'
@@ -67,7 +72,7 @@ class DessMonitorClient:
         self.session.headers.update({'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
         self.token = None
         self.secret = None
-        
+
         # Автоматически извлекаем все параметры устройства из переданного Request URL
         if DESS_REQUEST_URL:
             params = [(k, v) for k, v in parse_qsl(urlsplit(DESS_REQUEST_URL).query, keep_blank_values=True)
@@ -106,13 +111,28 @@ class DessMonitorClient:
             raise RuntimeError('Авторизация прошла без token/secret. Проверь company-key.')
         logger.info('DessMonitor: авторизация выполнена успешно')
 
-    def read(self):
-        self.authenticate()
+    # //Щербаков 14.11.2026
+    def _request_data(self):
         salt = str(int(time.time() * 1000))
         action = '&' + urlencode(self.device_parameters, quote_via=quote)
         sign = sha1(salt + self.secret + self.token + action)
         url = f'{DESS_API_BASE}?sign={sign}&salt={salt}&token={self.token}{action}'
         return self.get_json(url)
+
+    def read(self):
+        """Авторизация выполняется один раз за запуск и переиспользуется во всех циклах.
+        При ошибке токен сбрасывается, выполняется повторная авторизация и один повтор запроса."""
+        if not self.token or not self.secret:
+            self.authenticate()
+        try:
+            return self._request_data()
+        except Exception as exc:
+            logger.warning('Ошибка запроса данных (%s), повторная авторизация', exc)
+            self.token = None
+            self.secret = None
+            self.authenticate()
+            return self._request_data()
+    # //Щербаков 14.11.2026
 
 
 def flatten_items(value):
@@ -140,14 +160,14 @@ def extract_snapshot(payload):
     if not pars:
         raise ValueError('В ответе нет dat.pars')
     items = list(flatten_items(pars))
-    
+
     grid = next((as_number(i.get('val')) for i in items if i.get('id') == 'gd_eybond_read_7'), None)
     if grid is None:
         grid = next((as_number(i.get('val')) for i in items if re.search(r'^grid\s+voltage$', str(i.get('par', '')).strip(), re.I)), None)
-    
+
     mode = next((str(i.get('val', '')).strip() for i in items if re.search(r'operating\s*mode|working\s*mode', str(i.get('par', '')), re.I)), None)
     soc = next((as_number(i.get('val')) for i in items if re.search(r'\b(battery\s+(soc|capacity)|state\s+of\s+charge)\b', str(i.get('par', '')), re.I) and str(i.get('unit', '')).strip() in ('', '%')), None)
-    
+
     battery_voltage = next((as_number(i.get('val')) for i in items if re.search(r'\bbattery\s+voltage\b', str(i.get('par', '')), re.I) and str(i.get('unit', '')).strip() == 'V'), None)
     if battery_voltage is None:
         battery_voltage = next((as_number(i.get('val')) for i in items if i.get('id') == 'bt_eybond_read_20'), None)
@@ -189,6 +209,7 @@ def send_to_chat(chat_id, message):
                           json={'chat_id': str(chat_id), 'text': message, 'parse_mode': 'HTML'}, timeout=20)
         if r.status_code == 200 and r.json().get('ok'):
             return True
+        logger.error('❌ Telegram вернул %s для чата %s: %s', r.status_code, chat_id, r.text[:200])
     except Exception as error:
         logger.error('❌ Ошибка доставки в чат %s: %s', chat_id, error)
     return False
@@ -203,25 +224,16 @@ def fmt_voltage(value):
     return f'{value:.1f} В' if value is not None else 'не передано'
 
 
-def main():
-    validate_settings()
-    setup_logging()
-    
-    client = DessMonitorClient()
-    state = load_state()
-
-    try:
-        snap = extract_snapshot(client.read())
-    except Exception as exc:
-        logger.error('Ошибка получения данных от API: %s', exc)
-        return
+def run_check(client, state):
+    """Одна проверка: чтение данных, отправка уведомлений, сохранение состояния."""
+    snap = extract_snapshot(client.read())
 
     current_sample = snap['sample_id']
     current_status = snap['status']
     last_sample = state.get('last_seen_sample')
     prev_status = state.get('grid_status')
 
-    logger.info('Текущий семпл: %s | Статус: %s | Напряжение: %s | SOC: %s', 
+    logger.info('Текущий семпл: %s | Статус: %s | Напряжение: %s | SOC: %s',
                 current_sample, current_status, fmt_voltage(snap['voltage']), snap['soc'])
 
     if current_sample != last_sample:
@@ -231,7 +243,7 @@ def main():
                 notify(f'🔴 <b>ОТКЛЮЧИЛИ СВЕТ</b>\n\nСеть: {fmt_voltage(snap["voltage"])}\nОбнаружено: {time_label}')
             else:
                 notify(f'🟢 <b>СВЕТ ПОЯВИЛСЯ</b>\n\nСеть: {fmt_voltage(snap["voltage"])}\nОбнаружено: {time_label}')
-        
+
         state['grid_status'] = current_status
         state['last_seen_sample'] = current_sample
 
@@ -244,6 +256,34 @@ def main():
             state['low_battery'] = False
 
     save_state(state)
+
+
+def main():
+    validate_settings()
+    setup_logging()
+
+    client = DessMonitorClient()
+    state = load_state()
+    started = time.monotonic()
+
+    logger.info('Старт запуска: %d проверок с интервалом %d сек', CHECK_CYCLES, CHECK_INTERVAL)
+
+    for cycle in range(CHECK_CYCLES):
+        logger.info('--- Проверка %d из %d ---', cycle + 1, CHECK_CYCLES)
+        try:
+            run_check(client, state)
+        except Exception as exc:
+            # Ошибка одной проверки не должна прерывать остальные циклы
+            logger.error('Ошибка получения данных от API: %s', exc)
+
+        if cycle < CHECK_CYCLES - 1:
+            # Ждём до ближайшей "сетки" времени, чтобы интервал не плыл из-за длительности запроса
+            next_tick = started + (cycle + 1) * CHECK_INTERVAL
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+
+    logger.info('Запуск завершён за %.0f сек', time.monotonic() - started)
 
 
 if __name__ == '__main__':
