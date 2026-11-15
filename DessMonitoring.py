@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-"""DessMonitor -> Telegram: отключение/восстановление сети и низкий SOC.
-Запуск по cron раз в 5 минут; внутри одного запуска опрос каждую минуту."""
 import hashlib
 import json
 import logging
@@ -26,16 +23,14 @@ DESS_PASSWORD = os.getenv('DESS_PASSWORD', '')
 DESS_COMPANY_KEY = os.getenv('DESS_COMPANY_KEY', '')
 DESS_API_BASE = 'https://web.dessmonitor.com/public/'
 
-LOW_BATTERY_SOC = 20    # %
-RECOVERY_BATTERY_SOC = 25  # гистерезис SOC
+LOW_BATTERY_SOC = 20
+RECOVERY_BATTERY_SOC = 25
 LOW_BATTERY_VOLTAGE = float((os.getenv('DESS_LOW_BATTERY_VOLTAGE', '0') or '0').replace(',', '.')) or 0.0
 HTTP_TIMEOUT = 20
 
-# 5 проверок * 60 сек => работа ~4 минуты, запуск по cron каждые 5 минут.
-CHECK_CYCLES = max(1, int(os.getenv('DESS_CYCLES', '5') or '5'))
-CHECK_INTERVAL = max(1, int(os.getenv('DESS_INTERVAL', '60') or '60'))
+CHECK_CYCLES = max(1, int(os.getenv('DESS_CYCLES', '9') or '9'))
+CHECK_INTERVAL = max(1, int(os.getenv('DESS_INTERVAL', '30') or '30'))
 
-# Часовой пояс для вывода времени в уведомлениях (на runner GitHub системное время UTC).
 DESS_TZ = os.getenv('DESS_TZ', '') or 'Europe/Kyiv'
 DESS_TS_TZ = os.getenv('DESS_TS_TZ', '')
 
@@ -44,6 +39,11 @@ try:
     TS_ASSUMED_OFFSET = None if _raw_offset in ('', 'off', 'none') else float(_raw_offset.replace(',', '.'))
 except ValueError:
     TS_ASSUMED_OFFSET = None
+
+QUIET_WEEKDAYS = os.getenv('DESS_QUIET_WEEKDAYS', '')
+QUIET_WEEKENDS = os.getenv('DESS_QUIET_WEEKENDS', '')
+DEFAULT_QUIET_WEEKDAYS = '23:00-06:00'
+DEFAULT_QUIET_WEEKENDS = '23:00-08:00'
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / 'dessmonitor_state.json'
@@ -62,8 +62,6 @@ def get_tz(name):
 
 
 def parse_measured_at(ts):
-    """Время замера с инвертора (поле gts) -> datetime в часовом поясе DESS_TZ.
-    Поддерживаются epoch (сек/мс) и строка 'YYYY-MM-DD HH:MM:SS'."""
     if ts is None:
         return None
     display_tz = get_tz(DESS_TZ)
@@ -74,7 +72,6 @@ def parse_measured_at(ts):
             numeric /= 1000.0
         utc_dt = datetime.fromtimestamp(numeric, timezone.utc)
         if TS_ASSUMED_OFFSET is not None:
-            # Возвращаем исходное местное время сборщика: epoch + N часов = "настенные" часы
             wall = (utc_dt + timedelta(hours=TS_ASSUMED_OFFSET)).replace(tzinfo=None)
             return wall.replace(tzinfo=display_tz)
         return utc_dt.astimezone(display_tz)
@@ -93,6 +90,33 @@ def parse_measured_at(ts):
 
 def fmt_dt(value):
     return value.strftime('%d.%m.%Y %H:%M:%S') if value else 'не передано'
+
+
+def parse_interval(raw, default):
+    cleaned = re.sub(r'\s+', '', raw or '')
+    for candidate in (cleaned, default):
+        match = re.fullmatch(r'(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})', candidate)
+        if match:
+            h1, m1, h2, m2 = (int(x) for x in match.groups())
+            if h1 < 24 and h2 < 24 and m1 < 60 and m2 < 60:
+                if candidate != cleaned and cleaned:
+                    logger.warning('Неверный формат интервала "%s", используется %s', raw, default)
+                return h1 * 60 + m1, h2 * 60 + m2
+    return 23 * 60, 6 * 60
+
+
+def is_quiet_time(now=None):
+    now = now or datetime.now(get_tz(DESS_TZ))
+    if now.weekday() >= 5:
+        start, end = parse_interval(QUIET_WEEKENDS, DEFAULT_QUIET_WEEKENDS)
+    else:
+        start, end = parse_interval(QUIET_WEEKDAYS, DEFAULT_QUIET_WEEKDAYS)
+    minutes = now.hour * 60 + now.minute
+    if start == end:
+        return False
+    if start < end:
+        return start <= minutes < end
+    return minutes >= start or minutes < end
 
 
 def validate_settings():
@@ -125,7 +149,6 @@ class DessMonitorClient:
         self.token = None
         self.secret = None
 
-        # Автоматически извлекаем все параметры устройства из переданного Request URL
         if DESS_REQUEST_URL:
             params = [(k, v) for k, v in parse_qsl(urlsplit(DESS_REQUEST_URL).query, keep_blank_values=True)
                       if k not in ('sign', 'salt', 'token')]
@@ -171,8 +194,6 @@ class DessMonitorClient:
         return self.get_json(url)
 
     def read(self):
-        """Авторизация выполняется один раз за запуск и переиспользуется во всех циклах.
-        При ошибке токен сбрасывается, выполняется повторная авторизация и один повтор запроса."""
         if not self.token or not self.secret:
             self.authenticate()
         try:
@@ -236,9 +257,7 @@ def extract_snapshot(payload):
         'soc': soc, 'battery_voltage': battery_voltage,
         'measured_at': measured_at.isoformat() if measured_at else None,
         'measured_label': fmt_dt(measured_at) if measured_at else None,
-        # //Щербаков 14.11.2026
         'lag_sec': lag_sec,
-        # //Щербаков 14.11.2026
         'sample_id': str(ts) if ts is not None else None
     }
 
@@ -254,10 +273,11 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def send_to_chat(chat_id, message):
+def send_to_chat(chat_id, message, silent=False):
     try:
         r = requests.post(f'{TELEGRAM_API}/bot{TG_TOKEN}/sendMessage',
-                          json={'chat_id': str(chat_id), 'text': message, 'parse_mode': 'HTML'}, timeout=20)
+                          json={'chat_id': str(chat_id), 'text': message, 'parse_mode': 'HTML',
+                                'disable_notification': silent}, timeout=20)
         if r.status_code == 200 and r.json().get('ok'):
             return True
         logger.error('❌ Telegram вернул %s для чата %s: %s', r.status_code, chat_id, r.text[:200])
@@ -267,8 +287,10 @@ def send_to_chat(chat_id, message):
 
 
 def notify(message):
+    silent = is_quiet_time()
+    logger.info('Отправка уведомления (беззвучно: %s)', 'да' if silent else 'нет')
     for chat_id in TG_CHAT_IDS:
-        send_to_chat(chat_id, message)
+        send_to_chat(chat_id, message, silent)
 
 
 def fmt_voltage(value):
@@ -276,7 +298,6 @@ def fmt_voltage(value):
 
 
 def run_check(client, state):
-    """Одна проверка: чтение данных, отправка уведомлений, сохранение состояния."""
     snap = extract_snapshot(client.read())
 
     current_sample = snap['sample_id']
@@ -327,11 +348,9 @@ def main():
         try:
             run_check(client, state)
         except Exception as exc:
-            # Ошибка одной проверки не должна прерывать остальные циклы
             logger.error('Ошибка получения данных от API: %s', exc)
 
         if cycle < CHECK_CYCLES - 1:
-            # Ждём до ближайшей "сетки" времени, чтобы интервал не плыл из-за длительности запроса
             next_tick = started + (cycle + 1) * CHECK_INTERVAL
             delay = next_tick - time.monotonic()
             if delay > 0:
