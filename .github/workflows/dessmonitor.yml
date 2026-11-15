@@ -45,7 +45,7 @@ jobs:
           DESS_COMPANY_KEY: ${{ secrets.DESS_COMPANY_KEY }}
           DESS_QUIET_WEEKDAYS: ${{ secrets.DESS_QUIET_WEEKDAYS }}
           DESS_QUIET_WEEKENDS: ${{ secrets.DESS_QUIET_WEEKENDS }}
-          DESS_CYCLES: '9'
+          DESS_CYCLES: '10'
           DESS_INTERVAL: '30'
           DESS_TZ: 'Europe/Kyiv'
         run: python DessMonitoring.py
