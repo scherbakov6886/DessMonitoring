@@ -1,12 +1,8 @@
 name: DessMonitor
 
 on:
-  # Щербаков 14.11.2026
-  # Расписание убрано: запуск раз в 5 минут вызывает внешний сервис cron-job.org через API GitHub
   workflow_dispatch:
-  # Щербаков 14.11.2026
 
-# Не запускать два job одновременно
 concurrency:
   group: dessmonitor
   cancel-in-progress: false
@@ -17,7 +13,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 6      # скрипт работает ~4 минуты (5 проверок по 60 сек)
+    timeout-minutes: 6
 
     steps:
       - name: Checkout
@@ -47,8 +43,9 @@ jobs:
           DESS_USER: ${{ secrets.DESS_USER }}
           DESS_PASSWORD: ${{ secrets.DESS_PASSWORD }}
           DESS_COMPANY_KEY: ${{ secrets.DESS_COMPANY_KEY }}
-          DESS_CYCLES: '5'      # количество проверок за запуск
-          DESS_INTERVAL: '60'   # интервал между проверками, сек
+          DESS_QUIET_WEEKDAYS: ${{ secrets.DESS_QUIET_WEEKDAYS }}
+          DESS_QUIET_WEEKENDS: ${{ secrets.DESS_QUIET_WEEKENDS }}
+          DESS_CYCLES: '9'
+          DESS_INTERVAL: '30'
           DESS_TZ: 'Europe/Kyiv'
-          # DESS_TS_TZ: 'UTC'   # раскомментируйте, если время замера в уведомлении сдвинуто
         run: python DessMonitoring.py
