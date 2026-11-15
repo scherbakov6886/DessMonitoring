@@ -42,8 +42,6 @@ except ValueError:
 
 QUIET_WEEKDAYS = os.getenv('DESS_QUIET_WEEKDAYS', '')
 QUIET_WEEKENDS = os.getenv('DESS_QUIET_WEEKENDS', '')
-DEFAULT_QUIET_WEEKDAYS = '23:00-06:00'
-DEFAULT_QUIET_WEEKENDS = '23:00-08:00'
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / 'dessmonitor_state.json'
@@ -92,25 +90,25 @@ def fmt_dt(value):
     return value.strftime('%d.%m.%Y %H:%M:%S') if value else 'не передано'
 
 
-def parse_interval(raw, default):
+def parse_interval(raw):
     cleaned = re.sub(r'\s+', '', raw or '')
-    for candidate in (cleaned, default):
-        match = re.fullmatch(r'(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})', candidate)
-        if match:
-            h1, m1, h2, m2 = (int(x) for x in match.groups())
-            if h1 < 24 and h2 < 24 and m1 < 60 and m2 < 60:
-                if candidate != cleaned and cleaned:
-                    logger.warning('Неверный формат интервала "%s", используется %s', raw, default)
-                return h1 * 60 + m1, h2 * 60 + m2
-    return 23 * 60, 6 * 60
+    if not cleaned:
+        return None
+    match = re.fullmatch(r'(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})', cleaned)
+    if match:
+        h1, m1, h2, m2 = (int(x) for x in match.groups())
+        if h1 < 24 and h2 < 24 and m1 < 60 and m2 < 60:
+            return h1 * 60 + m1, h2 * 60 + m2
+    logger.warning('Неверный формат интервала "%s" (нужен ЧЧ:ММ-ЧЧ:ММ), тихие часы не применяются', raw)
+    return None
 
 
 def is_quiet_time(now=None):
     now = now or datetime.now(get_tz(DESS_TZ))
-    if now.weekday() >= 5:
-        start, end = parse_interval(QUIET_WEEKENDS, DEFAULT_QUIET_WEEKENDS)
-    else:
-        start, end = parse_interval(QUIET_WEEKDAYS, DEFAULT_QUIET_WEEKDAYS)
+    interval = parse_interval(QUIET_WEEKENDS if now.weekday() >= 5 else QUIET_WEEKDAYS)
+    if interval is None:
+        return False
+    start, end = interval
     minutes = now.hour * 60 + now.minute
     if start == end:
         return False
